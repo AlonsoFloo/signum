@@ -13,6 +13,9 @@ import io.kotest.property.RandomSource
 import io.kotest.property.arbitrary.Codepoint
 import io.kotest.property.arbitrary.az
 import io.kotest.property.arbitrary.string
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 import kotlin.random.Random
 
 val AndroidKeyStoreProviderTests by matrixSuite {
@@ -38,5 +41,24 @@ val AndroidKeyStoreProviderTests by matrixSuite {
             it.verify(plaintext, signature) }.shouldSucceed()
         //@formatter:on
 
+    }
+
+    "Signing operation" - {
+        "cancels cleanly when the enclosing coroutine is cancelled" {
+            val alias = Arb.string(minSize = 32, maxSize = 32, Codepoint.az())
+                .sample(RandomSource.default()).value
+            try {
+                val signer = AndroidKeyStoreProvider.createSigningKey(alias).getOrThrow()
+                val job = GlobalScope.launch {
+                    signer.sign(byteArrayOf(1, 2, 3, 4))
+                }
+                yield()
+                job.cancel()
+                job.join()
+                io.kotest.matchers.shouldBe(job.isCancelled, true)
+            } finally {
+                AndroidKeyStoreProvider.deleteSigningKey(alias)
+            }
+        }
     }
 }

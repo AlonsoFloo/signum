@@ -5,6 +5,7 @@ import at.asitplus.signum.indispensable.*
 import at.asitplus.signum.indispensable.SecretExposure
 import at.asitplus.signum.supreme.signCatching
 import com.ionspin.kotlin.bignum.integer.base63.toJavaBigInteger
+import kotlinx.coroutines.ensureActive
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.PrivateKey
@@ -27,6 +28,7 @@ actual class EphemeralSignerConfiguration internal actual constructor(): Ephemer
 sealed class EphemeralSigner (internal val privateKey: PrivateKey, private val provider: String?) : Signer {
     override val mayRequireUserUnlock = false
     override suspend fun sign(data: SignatureInput) = signCatching {
+        ensureActive()
         val preHashed = (data.format != null)
         if (preHashed) {
             require (data.format == signatureAlgorithm.preHashedSignatureFormat)
@@ -38,7 +40,11 @@ sealed class EphemeralSigner (internal val privateKey: PrivateKey, private val p
             signatureAlgorithm.getJCASignatureInstance(provider = provider))
             .run {
                 initSign(privateKey)
-                data.data.forEach { update(it) }
+                data.data.forEach { chunk ->
+                    ensureActive()
+                    update(chunk)
+                }
+                ensureActive()
                 sign().let(::parseFromJca)
             }
     }

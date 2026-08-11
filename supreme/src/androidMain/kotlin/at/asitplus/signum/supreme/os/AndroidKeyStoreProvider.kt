@@ -39,9 +39,12 @@ import at.asitplus.signum.supreme.sign.Signer as SignerI
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.KeyStore
@@ -303,13 +306,7 @@ sealed class AndroidKeystoreSigner private constructor(
 
     final override val mayRequireUserUnlock: Boolean get() = this.needsAuthentication
 
-    private sealed interface AuthResult {
-        @JvmInline value class Success(val result: AuthenticationResult): AuthResult
-        data class Error(val code: Int, val message: String): AuthResult
-    }
-
     protected suspend fun attemptBiometry(config: DSL.ConfigStack<AndroidUnlockPromptConfiguration>, forSpecificKey: CryptoObject?) {
-        val channel = Channel<AuthResult>(capacity = Channel.RENDEZVOUS)
         val effectiveContext = config.getProperty(AndroidUnlockPromptConfiguration::explicitContext,
             checker = AndroidUnlockPromptConfiguration::hasExplicitContext, default = {
                 (AppLifecycleMonitor.currentActivity as? FragmentActivity)?.let(FragmentContext::OfActivity)
@@ -320,43 +317,51 @@ sealed class AndroidKeystoreSigner private constructor(
             is FragmentContext.OfActivity -> ContextCompat.getMainExecutor(effectiveContext.activity)
             is FragmentContext.OfFragment -> ContextCompat.getMainExecutor(effectiveContext.fragment.context)
         }
-        executor.asCoroutineDispatcher().let(::CoroutineScope).launch {
-            val promptInfo = BiometricPrompt.PromptInfo.Builder().apply {
-                setTitle(config.getProperty(AndroidUnlockPromptConfiguration::_message,
-                    default = UnlockPromptConfiguration.defaultMessage))
-                setNegativeButtonText(config.getProperty(AndroidUnlockPromptConfiguration::_cancelText,
-                    default = UnlockPromptConfiguration.defaultCancelText))
-                config.getProperty(AndroidUnlockPromptConfiguration::_subtitle,null)?.let(this::setSubtitle)
-                config.getProperty(AndroidUnlockPromptConfiguration::_description,null)?.let(this::setDescription)
-                config.getProperty(AndroidUnlockPromptConfiguration::_allowedAuthenticators,null)?.let(this::setAllowedAuthenticators)
-                config.getProperty(AndroidUnlockPromptConfiguration::_confirmationRequired,null)?.let(this::setConfirmationRequired)
-            }.build()
-            val siphon = object: BiometricPrompt.AuthenticationCallback() {
-                private fun send(v: AuthResult) {
-                    executor.asCoroutineDispatcher().let(::CoroutineScope).launch { channel.send(v) }
+        suspendCancellableCoroutine<Unit> { cont ->
+            var activePrompt: BiometricPrompt? = null
+            executor.execute {
+                val promptInfo = BiometricPrompt.PromptInfo.Builder().apply {
+                    setTitle(config.getProperty(AndroidUnlockPromptConfiguration::_message,
+                        default = UnlockPromptConfiguration.defaultMessage))
+                    setNegativeButtonText(config.getProperty(AndroidUnlockPromptConfiguration::_cancelText,
+                        default = UnlockPromptConfiguration.defaultCancelText))
+                    config.getProperty(AndroidUnlockPromptConfiguration::_subtitle,null)?.let(this::setSubtitle)
+                    config.getProperty(AndroidUnlockPromptConfiguration::_description,null)?.let(this::setDescription)
+                    config.getProperty(AndroidUnlockPromptConfiguration::_allowedAuthenticators,null)?.let(this::setAllowedAuthenticators)
+                    config.getProperty(AndroidUnlockPromptConfiguration::_confirmationRequired,null)?.let(this::setConfirmationRequired)
+                }.build()
+                val siphon = object: BiometricPrompt.AuthenticationCallback() {
+                    override fun onAuthenticationSucceeded(result: AuthenticationResult) {
+                        if (cont.isActive) cont.resume(Unit)
+                    }
+                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        if (cont.isActive) {
+                            if (cont.isCancelled && (errorCode == BiometricPrompt.ERROR_CANCELED || errorCode == BiometricPrompt.ERROR_USER_CANCELED || errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON)) {
+                                cont.cancel()
+                            } else {
+                                cont.resumeWithException(UnlockFailed("$errString (code $errorCode)"))
+                            }
+                        }
+                    }
+                    override fun onAuthenticationFailed() {
+                        config.forEach { it.invalidBiometryCallback?.invoke() }
+                    }
                 }
-                override fun onAuthenticationSucceeded(result: AuthenticationResult) {
-                    send(AuthResult.Success(result))
+                val prompt = when (effectiveContext) {
+                    is FragmentContext.OfActivity -> BiometricPrompt(effectiveContext.activity, executor, siphon)
+                    is FragmentContext.OfFragment -> BiometricPrompt(effectiveContext.fragment, executor, siphon)
                 }
-                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                    send(AuthResult.Error(errorCode, errString.toString()))
-                }
-                override fun onAuthenticationFailed() {
-                    config.forEach { it.invalidBiometryCallback?.invoke() }
+                activePrompt = prompt
+                when (forSpecificKey) {
+                    null -> prompt.authenticate(promptInfo)
+                    else -> prompt.authenticate(promptInfo, forSpecificKey)
                 }
             }
-            val prompt = when (effectiveContext) {
-                is FragmentContext.OfActivity -> BiometricPrompt(effectiveContext.activity, executor, siphon)
-                is FragmentContext.OfFragment -> BiometricPrompt(effectiveContext.fragment, executor, siphon)
+            cont.invokeOnCancellation {
+                executor.execute {
+                    activePrompt?.cancelAuthentication()
+                }
             }
-            when (forSpecificKey) {
-                null -> prompt.authenticate(promptInfo)
-                else -> prompt.authenticate(promptInfo, forSpecificKey)
-            }
-        }
-        when (val result = channel.receive()) {
-            is AuthResult.Success -> return
-            is AuthResult.Error -> throw UnlockFailed("${result.message} (code ${result.code})")
         }
     }
 
@@ -385,9 +390,17 @@ sealed class AndroidKeystoreSigner private constructor(
         data: SignatureInput,
         configure: DSLConfigureFn<AndroidSignerSigningConfiguration>
     ): SignatureResult<*> = withContext(dispatcher) { signCatching {
+        ensureActive()
         require(data.format == null)
         val jcaSig = getJCASignature(DSL.resolve(::AndroidSignerSigningConfiguration, configure))
-            .let { data.data.forEach(it::update); it.sign() }
+            .let { sig ->
+                data.data.forEach { chunk ->
+                    ensureActive()
+                    sig.update(chunk)
+                }
+                ensureActive()
+                sig.sign()
+            }
 
         return@signCatching when (this@AndroidKeystoreSigner) {
             is ECDSA -> CryptoSignature.EC.parseFromJca(jcaSig).withCurve(publicKey.curve)

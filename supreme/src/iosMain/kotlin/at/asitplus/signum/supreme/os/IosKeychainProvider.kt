@@ -18,7 +18,11 @@ import kotlinx.cinterop.*
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -134,10 +138,24 @@ sealed class IosSigner(final override val alias: String,
     val needsAuthenticationForEveryUse get() = metadata.needsUnlock && (metadata.unlockTimeout == Duration.ZERO)
     override val attestation get() = metadata.attestation
 
-    internal interface PrivateKeyManager { fun get(signingConfig: IosSignerSigningConfiguration): AutofreeVariable<SecKeyRef> }
+    /**
+     * Holds both the resolved private key reference and the [LAContext] that is currently
+     * driving any biometric / device-credential prompt for that key.
+     *
+     * [context] is `null` when no authentication is required (the key has no access-control,
+     * or a previously authenticated context is being re-used without a new prompt).
+     * When non-null it can be [invalidated][LAContext.invalidate] from any thread to abort
+     * an in-progress [SecKeyCreateSignature] call immediately.
+     */
+    internal data class PrivateKeyAccess(
+        val key: AutofreeVariable<SecKeyRef>,
+        val context: LAContext?
+    )
+
+    internal interface PrivateKeyManager { suspend fun get(signingConfig: IosSignerSigningConfiguration): PrivateKeyAccess }
     internal val privateKeyManager = object : PrivateKeyManager {
         private var storedKey: AutofreeVariable<SecKeyRef>? = null
-        override fun get(signingConfig: IosSignerSigningConfiguration): AutofreeVariable<SecKeyRef> {
+        override suspend fun get(signingConfig: IosSignerSigningConfiguration): PrivateKeyAccess {
             Napier.v { "Private Key access for alias $alias requested (needs unlock? ${metadata.needsUnlock}; timeout? ${metadata.unlockTimeout})" }
 
             val ctx: LAContext? /* the LAContext (potentially old if the timeout permits) to use */
@@ -148,7 +166,8 @@ sealed class IosSigner(final override val alias: String,
                     // if we are allowed to reuse the key, and we have the key, then reuse the key
                     storedKey?.let {
                         Napier.v { "Re-using cached private key reference for alias $alias" }
-                        return it
+                        // No active prompt — context is null so there is nothing to cancel
+                        return PrivateKeyAccess(it, null)
                     }
                     Napier.v { "Re-using successful LAContext to retrieve key with alias $alias" }
                     recordable = false
@@ -215,10 +234,25 @@ sealed class IosSigner(final override val alias: String,
 
             if (recordable && (ctx != null)) {
                 Napier.v { "Going to record successful LAContext after retrieving key $alias" }
-                // record the successful unlock timestamp and LAContext for reuse
-                // produce a dummy signature to ensure that the unlock has succeeded; this is required by secure enclave keys, which do not prompt for unlock until signing time
-                corecall { SecKeyCreateSignature(newPrivateKey.value, signatureAlgorithm.secKeyAlgorithmPreHashed,
-                    ByteArray(signatureAlgorithm.preHashedSignatureFormat!!.outputLength.bytes.toInt()).toNSData().let(::giveToCF), error)?.let(::CFRelease) }
+                // produce a dummy signature to ensure that the unlock has succeeded; this is required by secure enclave keys,
+                // which do not prompt for unlock until signing time.
+                // Wrapped in suspendCancellableCoroutine so that coroutine cancellation calls ctx.invalidate(),
+                // causing SecKeyCreateSignature to abort immediately with LAErrorUserCancel.
+                suspendCancellableCoroutine<Unit> { cont ->
+                    cont.invokeOnCancellation { ctx.invalidate() }
+                    try {
+                        corecall { SecKeyCreateSignature(newPrivateKey.value, signatureAlgorithm.secKeyAlgorithmPreHashed,
+                            ByteArray(signatureAlgorithm.preHashedSignatureFormat!!.outputLength.bytes.toInt()).toNSData().let(::giveToCF), error)?.let(::CFRelease) }
+                        cont.resume(Unit)
+                    } catch (x: CoreFoundationException) {
+                        // If the LAContext was invalidated by us (cont.isCancelled), propagate as CancellationException.
+                        if (x.nsError.domain == LAErrorDomain && x.nsError.code == LAErrorUserCancel && cont.isCancelled)
+                            cont.cancel()
+                        else cont.resumeWithException(x)
+                    } catch (x: Throwable) {
+                        cont.resumeWithException(x)
+                    }
+                }
 
                 // if we have reached this point, the unlock operation has definitively succeeded
                 LAContextStorage.successfulAuthentication = LAContextStorage.SuccessfulAuthentication(
@@ -228,7 +262,7 @@ sealed class IosSigner(final override val alias: String,
             if (!needsAuthenticationForEveryUse) {
                 storedKey = newPrivateKey
             }
-            return newPrivateKey
+            return PrivateKeyAccess(newPrivateKey, ctx)
         }
     }
 
@@ -243,24 +277,43 @@ sealed class IosSigner(final override val alias: String,
     protected abstract fun bytesToSignature(sigBytes: ByteArray): CryptoSignature.RawByteEncodable
     final override suspend fun sign(data: SignatureInput, configure: DSLConfigureFn<IosSignerSigningConfiguration>): SignatureResult<*> =
     withContext(dispatcher) { signCatching {
+        ensureActive()
         require(data.format == null) { "Pre-hashed data is unsupported on iOS" }
         require(metadata.allowSigning) { "Signing key purpose not set! Signing disallowed!" }
         val signingConfig = DSL.resolve(::IosSignerSigningConfiguration, configure)
         val algorithm = signatureAlgorithm.secKeyAlgorithmPreHashed
         val plaintext = data.convertTo(signatureAlgorithm.preHashedSignatureFormat).getOrThrow().data.first().toNSData()
-        val signatureBytes = try {
-            corecall {
-                SecKeyCreateSignature(privateKeyManager.get(signingConfig).value, algorithm, plaintext.let(::giveToCF), error)
-            }.takeFromCF<NSData>().toByteArray()
-        } catch (x: CoreFoundationException) { /* secure enclave failure */
-            if (x.nsError.domain == LAErrorDomain) when (x.nsError.code) {
-                LAErrorUserCancel, LAErrorAuthenticationFailed, LAErrorBiometryLockout -> throw UnlockFailed(x.nsError.localizedDescription, x)
-                else -> throw x
-            } else throw x
-        } catch (x: CFCryptoOperationFailed) { /* keychain failure */
-            when (x.osStatus) {
-                errSecUserCanceled, errSecAuthFailed -> throw UnlockFailed(x.message, x)
-                else -> throw x
+        ensureActive()
+        val access = privateKeyManager.get(signingConfig)
+        // Wrap the blocking SecKeyCreateSignature call in suspendCancellableCoroutine so that
+        // coroutine cancellation is forwarded to the LAContext via invalidate(), causing the
+        // native call to abort immediately rather than waiting for user interaction.
+        val signatureBytes = suspendCancellableCoroutine<ByteArray> { cont ->
+            cont.invokeOnCancellation { access.context?.invalidate() }
+            try {
+                val bytes = corecall {
+                    SecKeyCreateSignature(access.key.value, algorithm, plaintext.let(::giveToCF), error)
+                }.takeFromCF<NSData>().toByteArray()
+                cont.resume(bytes)
+            } catch (x: CoreFoundationException) { /* secure enclave failure */
+                if (x.nsError.domain == LAErrorDomain) when (x.nsError.code) {
+                    LAErrorUserCancel ->
+                        // Distinguish coroutine-triggered cancellation (we called invalidate()) from
+                        // genuine user cancellation (the user tapped Cancel on the biometric prompt).
+                        if (cont.isCancelled) cont.cancel()
+                        else cont.resumeWithException(UnlockFailed(x.nsError.localizedDescription, x))
+                    LAErrorAuthenticationFailed,
+                    LAErrorBiometryLockout -> cont.resumeWithException(UnlockFailed(x.nsError.localizedDescription, x))
+                    else -> cont.resumeWithException(x)
+                } else cont.resumeWithException(x)
+            } catch (x: CFCryptoOperationFailed) { /* keychain failure */
+                when (x.osStatus) {
+                    errSecUserCanceled ->
+                        if (cont.isCancelled) cont.cancel()
+                        else cont.resumeWithException(UnlockFailed(x.message, x))
+                    errSecAuthFailed -> cont.resumeWithException(UnlockFailed(x.message, x))
+                    else -> cont.resumeWithException(x)
+                }
             }
         }
         return@signCatching bytesToSignature(signatureBytes)
@@ -292,7 +345,7 @@ sealed class IosSigner(final override val alias: String,
         ) = catching {
             require(metadata.allowKeyAgreement) { "Key agreement purpose not set! Key agreement disallowed!" }
             val config = DSL.resolve(::IosSignerSigningConfiguration, configure)
-            performKeyAgreement(privateKeyManager.get(config).value, publicValue)
+            performKeyAgreement(privateKeyManager.get(config).key.value, publicValue)
         }
     }
 

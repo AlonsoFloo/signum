@@ -14,6 +14,9 @@ import io.kotest.property.RandomSource
 import io.kotest.property.arbitrary.Codepoint
 import io.kotest.property.arbitrary.az
 import io.kotest.property.arbitrary.string
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.random.Random
@@ -134,6 +137,20 @@ val JKSProviderTest  by matrixSuite {
                 data.data.forEach(sig::update)
                 sig.verify(signature.jcaSignatureBytes) shouldBe true
             }
+        }
+    }
+    "Signing operation" - {
+        "cancels cleanly when the enclosing coroutine is cancelled" {
+            val ks = JKSProvider.Ephemeral().getOrThrow()
+            val alias = "CancelTest"
+            val signer = ks.createSigningKey(alias).getOrThrow()
+            val job = GlobalScope.launch {
+                signer.sign(byteArrayOf(1, 2, 3, 4))
+            }
+            yield()
+            job.cancel()
+            job.join()
+            job.isCancelled shouldBe true
         }
     }
 }

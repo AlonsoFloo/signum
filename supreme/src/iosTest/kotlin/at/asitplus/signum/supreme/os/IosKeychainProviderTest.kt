@@ -7,6 +7,10 @@ import io.kotest.matchers.shouldBe
 import kotlin.random.Random
 
 
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
+
 val IosKeychainProviderTest by matrixSuite {
     "Creating a key with an alias that already exists" - {
 
@@ -42,6 +46,24 @@ val IosKeychainProviderTest by matrixSuite {
                 val recovered = IosKeychainProvider.getSignerForKey(alias)
                 recovered.shouldSucceed()
                 recovered.getOrThrow().publicKey shouldBe original.publicKey
+            } finally {
+                IosKeychainProvider.deleteSigningKey(alias)
+            }
+        }
+    }
+
+    "Signing operation" - {
+        "cancels cleanly when the enclosing coroutine is cancelled" {
+            val alias = Random.azString(32)
+            try {
+                val signer = IosKeychainProvider.createSigningKey(alias).getOrThrow()
+                val job = GlobalScope.launch {
+                    signer.sign(byteArrayOf(1, 2, 3, 4))
+                }
+                yield()
+                job.cancel()
+                job.join()
+                job.isCancelled shouldBe true
             } finally {
                 IosKeychainProvider.deleteSigningKey(alias)
             }
