@@ -390,15 +390,15 @@ sealed class AndroidKeystoreSigner private constructor(
         data: SignatureInput,
         configure: DSLConfigureFn<AndroidSignerSigningConfiguration>
     ): SignatureResult<*> = withContext(dispatcher) { signCatching {
-        ensureActive()
+        coroutineContext.ensureActive()
         require(data.format == null)
         val jcaSig = getJCASignature(DSL.resolve(::AndroidSignerSigningConfiguration, configure))
             .let { sig ->
                 data.data.forEach { chunk ->
-                    ensureActive()
+                    coroutineContext.ensureActive()
                     sig.update(chunk)
                 }
-                ensureActive()
+                coroutineContext.ensureActive()
                 sig.sign()
             }
 

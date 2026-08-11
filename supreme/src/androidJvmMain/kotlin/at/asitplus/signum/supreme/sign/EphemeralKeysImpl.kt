@@ -28,7 +28,7 @@ actual class EphemeralSignerConfiguration internal actual constructor(): Ephemer
 sealed class EphemeralSigner (internal val privateKey: PrivateKey, private val provider: String?) : Signer {
     override val mayRequireUserUnlock = false
     override suspend fun sign(data: SignatureInput) = signCatching {
-        ensureActive()
+        coroutineContext.ensureActive()
         val preHashed = (data.format != null)
         if (preHashed) {
             require (data.format == signatureAlgorithm.preHashedSignatureFormat)
@@ -41,10 +41,10 @@ sealed class EphemeralSigner (internal val privateKey: PrivateKey, private val p
             .run {
                 initSign(privateKey)
                 data.data.forEach { chunk ->
-                    ensureActive()
+                    coroutineContext.ensureActive()
                     update(chunk)
                 }
-                ensureActive()
+                coroutineContext.ensureActive()
                 sign().let(::parseFromJca)
             }
     }

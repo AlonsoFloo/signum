@@ -277,13 +277,13 @@ sealed class IosSigner(final override val alias: String,
     protected abstract fun bytesToSignature(sigBytes: ByteArray): CryptoSignature.RawByteEncodable
     final override suspend fun sign(data: SignatureInput, configure: DSLConfigureFn<IosSignerSigningConfiguration>): SignatureResult<*> =
     withContext(dispatcher) { signCatching {
-        ensureActive()
+        coroutineContext.ensureActive()
         require(data.format == null) { "Pre-hashed data is unsupported on iOS" }
         require(metadata.allowSigning) { "Signing key purpose not set! Signing disallowed!" }
         val signingConfig = DSL.resolve(::IosSignerSigningConfiguration, configure)
         val algorithm = signatureAlgorithm.secKeyAlgorithmPreHashed
         val plaintext = data.convertTo(signatureAlgorithm.preHashedSignatureFormat).getOrThrow().data.first().toNSData()
-        ensureActive()
+        coroutineContext.ensureActive()
         val access = privateKeyManager.get(signingConfig)
         // Wrap the blocking SecKeyCreateSignature call in suspendCancellableCoroutine so that
         // coroutine cancellation is forwarded to the LAContext via invalidate(), causing the
