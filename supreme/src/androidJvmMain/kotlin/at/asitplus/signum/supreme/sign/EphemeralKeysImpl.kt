@@ -5,6 +5,7 @@ import at.asitplus.signum.indispensable.*
 import at.asitplus.signum.indispensable.SecretExposure
 import at.asitplus.signum.supreme.signCatching
 import com.ionspin.kotlin.bignum.integer.base63.toJavaBigInteger
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.ensureActive
 import java.security.KeyPair
 import java.security.KeyPairGenerator
