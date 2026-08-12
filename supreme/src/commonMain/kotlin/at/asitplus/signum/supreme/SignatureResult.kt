@@ -58,6 +58,10 @@ inline fun <T: CryptoSignature.RawByteEncodable, S: CryptoSignature.RawByteEncod
 /** Runs the block, catches exceptions, and maps to [SignatureResult].
  * @see SignatureResult.FromException */
 internal inline fun signCatching(fn: ()->CryptoSignature.RawByteEncodable): SignatureResult<*> =
-    catching { fn() }.fold(
-        onSuccess = { SignatureResult.Success(it) },
-        onFailure = { SignatureResult.FromException(it) })
+    try {
+        SignatureResult.Success(fn())
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: Throwable) {
+        SignatureResult.FromException(e)
+    }
