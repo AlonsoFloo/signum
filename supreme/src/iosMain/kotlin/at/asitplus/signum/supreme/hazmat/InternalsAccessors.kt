@@ -20,7 +20,7 @@ val EphemeralKey.secKeyRef get() = (this as? EphemeralKeyBase<*>)?.privateKey as
 /** The underlying SecKeyRef referencing the signer's private key.
  * **⚠️ If returned from a keychain signer, must be used immediately. Do not store long term. ⚠️** */
 @HazardousMaterials
-val Signer.secKeyRef get() = when (this) {
+suspend val Signer.secKeyRef get() = when (this) {
     is EphemeralSigner -> this.privateKey
     is IosSigner -> this.privateKeyManager.get(IosSignerSigningConfiguration())
     else -> null
