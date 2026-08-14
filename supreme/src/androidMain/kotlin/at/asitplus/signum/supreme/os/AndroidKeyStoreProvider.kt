@@ -331,7 +331,7 @@ sealed class AndroidKeystoreSigner private constructor(
                         if (cont.isActive) cont.resume(Unit) {}
                     }
                     override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                        if (cont.isActive) cont.resumeWithException(UnlockFailed("$errString (code $errorCode)"))
+                        if (cont.isActive) cont.resumeWith(Result.failure(UnlockFailed("$errString (code $errorCode)")))
                     }
                     override fun onAuthenticationFailed() {
                         config.forEach { it.invalidBiometryCallback?.invoke() }

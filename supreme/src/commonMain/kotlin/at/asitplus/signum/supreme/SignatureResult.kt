@@ -5,6 +5,7 @@ import at.asitplus.catching
 import at.asitplus.signum.indispensable.CryptoSignature
 import kotlin.coroutines.coroutineContext
 import kotlin.jvm.JvmInline
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ensureActive
 
 /** These map to SignatureResult.Failure instead of SignatureResult.Error */
@@ -66,6 +67,7 @@ internal suspend inline fun signCatching(fn: ()->CryptoSignature.RawByteEncodabl
     return catching { fn() }.fold(
         onSuccess = { SignatureResult.Success(it) },
         onFailure = {
+            if (it is CancellationException) throw it
             coroutineContext.ensureActive()
             SignatureResult.FromException(it)
         })

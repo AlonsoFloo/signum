@@ -27,10 +27,8 @@ val SignCancellationTests by matrixSuite {
         val data = Random.Default.nextBytes(64)
         shouldThrow<CancellationException> {
             coroutineScope {
-                launch {
-                    cancel()
-                    signer.sign(data)
-                }
+                cancel()
+                signer.sign(data)
             }
         }
     }
